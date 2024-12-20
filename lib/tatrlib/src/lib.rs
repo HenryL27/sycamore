@@ -1,7 +1,8 @@
 use std::{
-    collections::{HashMap, HashSet},
+    cell::RefCell,
+    collections::{HashMap, HashSet, VecDeque},
     iter::FusedIterator,
-    ops::Deref,
+    ops::{Deref, DerefMut},
 };
 
 use pyo3::{
@@ -10,7 +11,7 @@ use pyo3::{
     types::{PyDict, PyFloat, PyList, PyString},
 };
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Copy)]
 enum Label {
     Table,
     Row,
@@ -20,7 +21,7 @@ enum Label {
     SpanningCell,
 }
 
-#[derive(Debug, FromPyObject)]
+#[derive(Debug, FromPyObject, Clone, Copy)]
 struct BBox {
     x1: f32,
     y1: f32,
@@ -28,7 +29,7 @@ struct BBox {
     y2: f32,
 }
 
-#[derive(Debug, FromPyObject)]
+#[derive(Debug, FromPyObject, Clone, Copy)]
 struct TableObject {
     #[pyo3(from_py_with = "convert_label")]
     pub label: Label,
@@ -54,14 +55,22 @@ struct TableToken {
     pub text: String,
 }
 
+struct TableStructure {
+    rows: Vec<RefCell<TableObject>>,
+    cols: Vec<RefCell<TableObject>>,
+    col_headers: Vec<RefCell<TableObject>>,
+    spans: Vec<RefCell<TableObject>>,
+    prhs: Vec<RefCell<TableObject>>,
+}
+
 struct ClassThresholds {
-    table: f32,
-    row: f32,
-    column: f32,
-    prh: f32,
-    col_header: f32,
-    spanning_cell: f32,
-    no_object: f32,
+    table: f64,
+    row: f64,
+    column: f64,
+    prh: f64,
+    col_header: f64,
+    spanning_cell: f64,
+    no_object: f64,
 }
 
 #[pyfunction]
@@ -73,50 +82,86 @@ fn objects_to_table(
 ) {
 }
 
+fn copy_objects(objects: &mut Vec<TableObject>) -> Vec<RefCell<TableObject>> {
+    let mutable_objects = &mut Vec::with_capacity(objects.len());
+    for o in objects {
+        let copied = RefCell::new(TableObject {
+            label: o.label.clone(),
+            score: o.score.clone(),
+            bbox: o.bbox.clone(),
+        });
+        mutable_objects.push(copied);
+    }
+    mutable_objects.to_owned()
+}
+
+fn copy_objects_mut(objects: &mut Vec<&mut TableObject>) -> Vec<RefCell<TableObject>> {
+    let mut mutable_objects = Vec::with_capacity(objects.len());
+    for o in objects {
+        let copied = RefCell::new(TableObject {
+            label: o.label.clone(),
+            score: o.score.clone(),
+            bbox: o.bbox.clone(),
+        });
+        mutable_objects.push(copied)
+    }
+    mutable_objects
+}
+
 #[pyfunction]
-fn objects_to_structures(
-    objects: Vec<TableObject>,
+fn objects_to_structures<'a>(
+    mut objects: Vec<TableObject>,
     tokens: Vec<TableToken>,
     #[pyo3(from_py_with = "convert_class_thresholds")] class_thresholds: ClassThresholds,
 ) -> Option<()> {
-    let first_table = objects.iter().find(|obj| obj.label == Label::Table)?;
-    let objs_in_table: Vec<&TableObject> = objects
+    let mutable_objects = copy_objects(&mut objects);
+    let mut first_table: Option<RefCell<TableObject>> = None;
+    for ob in &mutable_objects {
+        if ob.borrow().label == Label::Table {
+            first_table = Some(ob.clone());
+            break;
+        }
+    }
+    let first_table = first_table?;
+
+    let objs_in_table: Vec<RefCell<TableObject>> = mutable_objects
         .iter()
-        .filter(|&obj| iob(&obj.bbox, &first_table.bbox) >= 0.5)
+        .filter(|obj| iob(&obj.borrow().bbox, &first_table.borrow().bbox) >= 0.5)
+        .map(|obj| obj.clone())
         .collect();
     let tokens_in_table: Vec<&TableToken> = tokens
         .iter()
-        .filter(|&obj| iob(&obj.bbox, &first_table.bbox) >= 0.5)
+        .filter(|&obj| iob(&obj.bbox, &first_table.borrow().bbox) >= 0.5)
         .collect();
-    let mut columns: Vec<&TableObject> = objs_in_table
+    let mut columns: Vec<RefCell<TableObject>> = objs_in_table
         .iter()
-        .filter(|ob| ob.label == Label::Column)
-        .map(|&ob| ob)
+        .filter(|ob| ob.borrow().label == Label::Column)
+        .map(|ob| ob.clone())
         .collect();
-    let mut rows: Vec<&TableObject> = objs_in_table
+    let mut rows: Vec<RefCell<TableObject>> = objs_in_table
         .iter()
-        .filter(|ob| ob.label == Label::Row)
-        .map(|&ob| ob)
+        .filter(|ob| ob.borrow().label == Label::Row)
+        .map(|ob| ob.clone())
         .collect();
-    let column_headers: Vec<&TableObject> = objs_in_table
+    let column_headers: Vec<RefCell<TableObject>> = objs_in_table
         .iter()
-        .filter(|ob| ob.label == Label::ColumnHeader)
-        .map(|&ob| ob)
+        .filter(|ob| ob.borrow().label == Label::ColumnHeader)
+        .map(|ob| ob.clone())
         .collect();
-    let spanning_cells: Vec<&TableObject> = objs_in_table
+    let spanning_cells: Vec<RefCell<TableObject>> = objs_in_table
         .iter()
-        .filter(|ob| ob.label == Label::SpanningCell)
-        .map(|&ob| ob)
+        .filter(|ob| ob.borrow().label == Label::SpanningCell)
+        .map(|ob| ob.clone())
         .collect();
-    let prhs: Vec<&TableObject> = objs_in_table
+    let prhs: Vec<RefCell<TableObject>> = objs_in_table
         .iter()
-        .filter(|ob| ob.label == Label::ProjectedRowHeader)
-        .map(|&ob| ob)
+        .filter(|ob| ob.borrow().label == Label::ProjectedRowHeader)
+        .map(|ob| ob.clone())
         .collect();
     let mut col_header_rows = Vec::new();
     for row in &rows {
         for col_header in &column_headers {
-            if iob(&row.bbox, &col_header.bbox) >= 0.5 {
+            if iob(&row.borrow().bbox, &col_header.borrow().bbox) >= 0.5 {
                 col_header_rows.push(row);
             }
         }
@@ -128,10 +173,22 @@ fn objects_to_structures(
     // Shrink table bbox to just the total height of the rows
     // and the total width of the columns
     let row_rect = if rows.len() > 0 {
-        let x1 = rows.iter().map(|row| row.bbox.x1).min_by(f32::total_cmp)?;
-        let x2 = rows.iter().map(|row| row.bbox.x2).max_by(f32::total_cmp)?;
-        let y1 = rows.iter().map(|row| row.bbox.y1).min_by(f32::total_cmp)?;
-        let y2 = rows.iter().map(|row| row.bbox.y2).min_by(f32::total_cmp)?;
+        let x1 = rows
+            .iter()
+            .map(|row| row.borrow().bbox.x1)
+            .min_by(f32::total_cmp)?;
+        let x2 = rows
+            .iter()
+            .map(|row| row.borrow().bbox.x2)
+            .max_by(f32::total_cmp)?;
+        let y1 = rows
+            .iter()
+            .map(|row| row.borrow().bbox.y1)
+            .min_by(f32::total_cmp)?;
+        let y2 = rows
+            .iter()
+            .map(|row| row.borrow().bbox.y2)
+            .min_by(f32::total_cmp)?;
         BBox { x1, x2, y1, y2 }
     } else {
         BBox {
@@ -142,12 +199,24 @@ fn objects_to_structures(
         }
     };
     // Shorter lines -> autoformatter doesn't split each line into several
-    let cols = columns;
+    let cols = &columns;
     let col_rect = if cols.len() > 0 {
-        let x1 = cols.iter().map(|row| row.bbox.x1).min_by(f32::total_cmp)?;
-        let x2 = cols.iter().map(|row| row.bbox.x2).max_by(f32::total_cmp)?;
-        let y1 = cols.iter().map(|row| row.bbox.y1).min_by(f32::total_cmp)?;
-        let y2 = cols.iter().map(|row| row.bbox.y2).min_by(f32::total_cmp)?;
+        let x1 = cols
+            .iter()
+            .map(|row| row.borrow().bbox.x1)
+            .min_by(f32::total_cmp)?;
+        let x2 = cols
+            .iter()
+            .map(|row| row.borrow().bbox.x2)
+            .max_by(f32::total_cmp)?;
+        let y1 = cols
+            .iter()
+            .map(|row| row.borrow().bbox.y1)
+            .min_by(f32::total_cmp)?;
+        let y2 = cols
+            .iter()
+            .map(|row| row.borrow().bbox.y2)
+            .min_by(f32::total_cmp)?;
         BBox { x1, x2, y1, y2 }
     } else {
         BBox {
@@ -163,12 +232,379 @@ fn objects_to_structures(
         x2: col_rect.x2,
         y2: row_rect.y2,
     };
-    first_table.bbox.x1 = row_col_bbox.x1;
+    first_table.borrow_mut().bbox = row_col_bbox;
 
-    Some(())
+    align_columns(&mut columns, &row_col_bbox);
+    align_rows(&mut rows, &row_col_bbox);
+
+    if rows.is_empty() && row_rect.y1 < row_rect.y2 && col_rect.x1 < col_rect.x2 {
+        rows.push(RefCell::new(TableObject {
+            label: Label::Row,
+            score: 0.0001,
+            bbox: row_col_bbox,
+        }));
+    }
+    if columns.is_empty() && row_rect.y1 < row_rect.y2 && col_rect.x1 < col_rect.x2 {
+        columns.push(RefCell::new(TableObject {
+            label: Label::Column,
+            score: 0.0001,
+            bbox: row_col_bbox,
+        }));
+    }
+    let structure = &mut TableStructure {
+        rows: rows,
+        cols: columns,
+        col_headers: column_headers,
+        spans: spanning_cells,
+        prhs: prhs,
+    };
+
+    if structure.cols.len() > 1 && structure.rows.len() > 0 {
+        refine_table_structure(structure, &class_thresholds);
+    }
+
+    None
 }
 
-fn refine_rows(mut rows: &mut Vec<&TableObject>, tokens: &Vec<&TableToken>, threshold: f32) {
+fn refine_table_structure(structure: &mut TableStructure, thresholds: &ClassThresholds) {
+    let rows = &mut structure.rows;
+    let cols = &mut structure.cols;
+
+    // column headers
+    let col_headers = &mut structure.col_headers;
+    apply_threshold(col_headers, thresholds.col_header);
+    nms(col_headers, NMSMatchCriteria::Object2Overlap, 0.05, true);
+    let mut header_row_nums = align_headers(col_headers, rows);
+    header_row_nums.sort();
+
+    // spanning cells
+    let spans = &mut structure.spans;
+    let prhs = &mut structure.prhs;
+    apply_threshold(spans, thresholds.spanning_cell);
+    apply_threshold(prhs, thresholds.prh);
+    spans.append(prhs);
+
+    let supercells = &mut align_supercells(spans, rows, cols, header_row_nums);
+    nms_supercells(supercells);
+    header_supercell_tree(supercells);
+}
+
+fn header_supercell_tree(supercells: &mut Vec<RefCell<TableCell>>) {}
+
+fn nms_supercells(supercells: &mut Vec<RefCell<TableCell>>) {
+    supercells.sort_by(|a, b| {
+        a.borrow()
+            .inner
+            .borrow()
+            .score
+            .total_cmp(&b.borrow().inner.borrow().score)
+    });
+    let num_supercells = supercells.len();
+    let mut suppression = Vec::with_capacity(num_supercells);
+    suppression.fill(false);
+    for sc2_num in 1..num_supercells {
+        let sc2 = &supercells[sc2_num];
+        for sc1_num in 0..sc2_num {
+            let sc1 = &supercells[sc1_num];
+            remove_supercell_overlap(sc1, sc2);
+        }
+        if sc2.borrow().cols.len() * sc2.borrow().rows.len() < 2 {
+            suppression[sc2_num] = true;
+        }
+    }
+    for i in (0..num_supercells).rev() {
+        if suppression[i] {
+            supercells.remove(i);
+        }
+    }
+}
+
+fn remove_supercell_overlap(sc1: &RefCell<TableCell>, sc2: &RefCell<TableCell>) {
+    let sc1_rns = &mut sc1.borrow_mut().rows;
+    let sc1_cns = &mut sc1.borrow_mut().cols;
+    let sc2_rns = &mut sc2.borrow_mut().rows;
+    let sc2_cns = &mut sc2.borrow_mut().cols;
+    sc1_rns.sort();
+    sc1_cns.sort();
+    sc2_rns.sort();
+    sc2_cns.sort();
+    let mut common_rows = {
+        let mut x = Vec::new();
+        let mut j = 0;
+        for i in 0..sc1_rns.len() {
+            let rn1 = sc1_rns[i];
+            let mut rn2 = sc2_rns[j];
+            while rn2 < rn1 {
+                j += 1;
+                rn2 = sc2_rns[j]
+            }
+            if rn1 == rn2 {
+                x.push(rn1)
+            }
+        }
+        x
+    };
+    let mut common_cols = {
+        let mut x = Vec::new();
+        let mut j = 0;
+        for i in 0..sc1_cns.len() {
+            let cn1 = sc1_cns[i];
+            let mut cn2 = sc2_cns[j];
+            while cn2 < cn1 {
+                j += 1;
+                cn2 = sc2_cns[j]
+            }
+            if cn1 == cn2 {
+                x.push(cn1)
+            }
+        }
+        x
+    };
+
+    while common_rows.len() > 0 && common_cols.len() > 0 {
+        if sc2_rns.len() < sc2_cns.len() {
+            let min_col = sc2_cns[0];
+            let max_col = sc2_cns[sc2_cns.len() - 1];
+            let common_max_pos = common_cols.binary_search(&max_col);
+            let common_min_pos = common_cols.binary_search(&min_col);
+            if common_max_pos.is_ok() {
+                common_cols.remove(common_max_pos.unwrap());
+                sc2_cns.pop();
+            } else if common_min_pos.is_ok() {
+                common_cols.remove(common_min_pos.unwrap());
+                sc2_cns.remove(0);
+            } else {
+                common_cols.clear();
+                sc2_cns.clear();
+            }
+        } else {
+            let min_row = sc2_rns[0];
+            let max_row = sc2_rns[sc2_rns.len() - 1];
+            let common_max_pos = common_rows.binary_search(&max_row);
+            let common_min_pos = common_rows.binary_search(&min_row);
+            if common_max_pos.is_ok() {
+                common_rows.remove(common_max_pos.unwrap());
+                sc2_rns.pop();
+            } else if common_min_pos.is_ok() {
+                common_rows.remove(common_min_pos.unwrap());
+                sc2_rns.remove(0);
+            } else {
+                common_rows.clear();
+                sc2_rns.clear();
+            }
+        }
+    }
+}
+
+fn align_supercells(
+    supercells: &mut Vec<RefCell<TableObject>>,
+    rows: &mut Vec<RefCell<TableObject>>,
+    cols: &mut Vec<RefCell<TableObject>>,
+    header_row_nums: Vec<usize>,
+) -> Vec<RefCell<TableCell>> {
+    // For each supercell, align it to the rows it intersects 50% of the height of,
+    // and the columns it intersects 50% of the width of.
+    // Eliminate supercells for which there are no rows and columns it intersects 50% with.
+    let mut aligned_supercells = Vec::new();
+
+    for supercell in supercells.iter() {
+        let mut header = false;
+        let mut row_bbox_rect: Option<BBox> = None;
+        let mut col_bbox_rect: Option<BBox> = None;
+        let mut header_intersects = HashSet::new();
+        let mut data_intersects = HashSet::new();
+
+        for i in 0..rows.len() {
+            let row = &rows[i];
+            let rh = row.borrow().bbox.y2 - row.borrow().bbox.y1;
+            let sch = supercell.borrow().bbox.y2 - supercell.borrow().bbox.y1;
+            let min_row_overlap = row.borrow().bbox.y1.min(supercell.borrow().bbox.y1);
+            let max_row_overlap = row.borrow().bbox.y2.max(supercell.borrow().bbox.y2);
+            let overlap_height = max_row_overlap - min_row_overlap;
+            // python: if "span" in supercell do something else
+            // - I couldn't find a place where we set the span key
+            let overlap_fraction = overlap_height / rh;
+            if overlap_fraction >= 0.5 {
+                if header_row_nums.binary_search(&i).is_ok() {
+                    header_intersects.insert(i);
+                } else {
+                    data_intersects.insert(i);
+                }
+            }
+        }
+        // Supercell cannot span across header boundary; eliminate whichever
+        // is smallest
+        if header_intersects.len() > 0 && data_intersects.len() > 0 {
+            if header_intersects.len() > data_intersects.len() {
+                data_intersects.clear();
+            } else {
+                header_intersects.clear();
+            }
+        }
+        if header_intersects.len() > 0 {
+            header = true;
+        }
+        // python: elif "span" in supercell continue
+        // - see previous note about the "span" key
+        let intersecting_rows = if header_intersects.len() > 0 {
+            header_intersects
+        } else {
+            data_intersects
+        };
+        for rn in intersecting_rows.iter() {
+            row_bbox_rect = match row_bbox_rect {
+                Some(bb) => Some(bb.union(&rows[*rn].borrow().bbox)),
+                None => Some(rows[*rn].borrow().bbox),
+            }
+        }
+        if row_bbox_rect.is_none() {
+            continue;
+        }
+        let row_bbox_rect = row_bbox_rect.unwrap();
+
+        let mut intersecting_cols = Vec::new();
+        for i in 0..cols.len() {
+            let col = &cols[i];
+            let cw = col.borrow().bbox.x2 - col.borrow().bbox.x1;
+            let scw = supercell.borrow().bbox.x2 - supercell.borrow().bbox.x1;
+            let min_col_overlap = col.borrow().bbox.x1.max(supercell.borrow().bbox.x1);
+            let max_col_overlap = col.borrow().bbox.x2.min(supercell.borrow().bbox.x2);
+            let overlap_width = max_col_overlap - min_col_overlap;
+            // python: if "span" in supercell do something else
+            // - couldn't find where we set the "span" key so drop that branch
+            let overlap_fraction = overlap_width / cw;
+            if overlap_fraction >= 0.5 {
+                intersecting_cols.push(i);
+            }
+            col_bbox_rect = match col_bbox_rect {
+                Some(bb) => Some(bb.union(&col.borrow().bbox)),
+                None => Some(col.borrow().bbox),
+            };
+        }
+        if col_bbox_rect.is_none() {
+            continue;
+        }
+        let col_bbox_rect = col_bbox_rect.unwrap();
+
+        supercell.borrow_mut().bbox = row_bbox_rect.intersect(&col_bbox_rect);
+
+        // only a true supercell if it joins across multiple rows or columns
+        if intersecting_cols.len() * intersecting_rows.len() > 1 {
+            let row_numbers: Vec<usize> = intersecting_rows.into_iter().collect();
+            aligned_supercells.push(RefCell::new(TableCell {
+                rows: row_numbers,
+                cols: intersecting_cols,
+                inner: supercell.to_owned(),
+            }));
+            // python: if "span" in supercell and other stuff do other stuff
+            // - see other span stuff.
+        }
+    }
+    return aligned_supercells;
+}
+
+struct TableCell {
+    rows: Vec<usize>,
+    cols: Vec<usize>,
+    inner: RefCell<TableObject>,
+}
+
+fn align_headers(
+    col_headers: &mut Vec<RefCell<TableObject>>,
+    rows: &mut Vec<RefCell<TableObject>>,
+) -> Vec<usize> {
+    let mut aligned_headers = Vec::new();
+    let mut are_headers: Vec<bool> = Vec::with_capacity(rows.len());
+    are_headers.fill(false);
+    let mut header_row_nums: Vec<usize> = Vec::new();
+    for header in col_headers.iter() {
+        for i in 0..rows.len() {
+            let r = &rows[i];
+            let rh = r.borrow().bbox.y2 - r.borrow().bbox.y1;
+            let min_row_overlap = r.borrow().bbox.y1.min(header.borrow().bbox.y1);
+            let max_row_overlap = r.borrow().bbox.y2.max(header.borrow().bbox.y2);
+            let overlap_height = max_row_overlap - min_row_overlap;
+            if rh == 0.0 {
+                if overlap_height == header.borrow().bbox.y2 - header.borrow().bbox.y1 {
+                    header_row_nums.push(i);
+                }
+                continue;
+            }
+            if overlap_height / rh >= 0.5 {
+                header_row_nums.push(i)
+            }
+        }
+    }
+    if header_row_nums.len() == 0 {
+        return header_row_nums;
+    }
+    let mut header_rect: Option<BBox> = None;
+    if header_row_nums[0] > 0 {
+        // python: header_row_nums = list(range(header_row_nums[0] + 1)) + header_row_nums
+        let first = header_row_nums[0];
+        let origlen = header_row_nums.len();
+        let mut temp: Vec<usize> = (0..first).collect();
+        header_row_nums.append(&mut temp);
+        for i in 0..first {
+            header_row_nums.swap(i, i + origlen);
+        }
+    }
+
+    for i in 0..header_row_nums.len() {
+        // python: last = -1; for rn in header_rns: if rn == last + 1:
+        // rust - usize can't be negative. point is to make sure nums are contiguous.
+        let rn = header_row_nums[i];
+        if rn == i {
+            let row = &rows[rn];
+            are_headers[rn] = true;
+            header_rect = match header_rect {
+                Some(bb) => Some(bb.union(&row.borrow().bbox)),
+                None => Some(row.borrow().bbox),
+            };
+        } else {
+            break;
+        }
+    }
+
+    let header_rect = header_rect.unwrap();
+    aligned_headers.push(RefCell::new(TableObject {
+        label: Label::ColumnHeader,
+        score: 1.00,
+        bbox: header_rect,
+    }));
+
+    col_headers.clear();
+    col_headers.append(&mut aligned_headers);
+    header_row_nums
+}
+
+fn apply_threshold(objects: &mut Vec<RefCell<TableObject>>, threshold: f64) {
+    for i in (0..objects.len()).rev() {
+        if objects[i].borrow().score < threshold {
+            objects.remove(i);
+        }
+    }
+}
+
+fn align_columns(columns: &mut Vec<RefCell<TableObject>>, rc_bbox: &BBox) {
+    for c in columns {
+        c.borrow_mut().bbox.y1 = rc_bbox.y1;
+        c.borrow_mut().bbox.y2 = rc_bbox.y2;
+    }
+}
+
+fn align_rows(rows: &mut Vec<RefCell<TableObject>>, rc_bbox: &BBox) {
+    for r in rows {
+        r.borrow_mut().bbox.x1 = rc_bbox.x1;
+        r.borrow_mut().bbox.x2 = rc_bbox.x2;
+    }
+}
+
+fn refine_rows(
+    mut rows: &mut Vec<RefCell<TableObject>>,
+    tokens: &Vec<&TableToken>,
+    threshold: f64,
+) {
     if tokens.len() > 0 {
         nms_by_containment(&mut rows, tokens, 0.5, true);
         remove_objects_without_content(tokens, &mut rows);
@@ -177,21 +613,27 @@ fn refine_rows(mut rows: &mut Vec<&TableObject>, tokens: &Vec<&TableToken>, thre
     }
     if rows.len() > 1 {
         rows.sort_by(|ob1, ob2| {
-            (ob1.bbox.y1 + ob1.bbox.y2).total_cmp(&(ob2.bbox.y1 + ob2.bbox.y2))
+            (ob1.borrow().bbox.y1 + ob1.borrow().bbox.y2)
+                .total_cmp(&(ob2.borrow().bbox.y1 + ob2.borrow().bbox.y2))
         });
     }
 }
 
-fn refine_columns(mut cols: &mut Vec<&TableObject>, tokens: &Vec<&TableToken>, threshold: f32) {
+fn refine_columns(
+    mut cols: &mut Vec<RefCell<TableObject>>,
+    tokens: &Vec<&TableToken>,
+    threshold: f64,
+) {
     if tokens.len() > 0 {
-        nms_by_containment(&mut cols, tokens, 0.5, false);
-        remove_objects_without_content(tokens, &mut cols);
+        nms_by_containment(cols, tokens, 0.5, false);
+        remove_objects_without_content(tokens, cols);
     } else {
         nms(&mut cols, NMSMatchCriteria::Object2Overlap, 0.5, true);
     }
     if cols.len() > 1 {
         cols.sort_by(|ob1, ob2| {
-            (ob1.bbox.x1 + ob1.bbox.x2).total_cmp(&(ob2.bbox.x1 + ob2.bbox.x2))
+            (ob1.borrow().bbox.x1 + ob1.borrow().bbox.x2)
+                .total_cmp(&(ob2.borrow().bbox.x1 + ob2.borrow().bbox.x2))
         });
     }
 }
@@ -203,7 +645,7 @@ enum NMSMatchCriteria {
 }
 
 fn nms(
-    objects: &mut Vec<&TableObject>,
+    objects: &mut Vec<RefCell<TableObject>>,
     match_criteria: NMSMatchCriteria,
     match_threshold: f32,
     keep_higher: bool,
@@ -213,8 +655,8 @@ fn nms(
     }
 
     objects.sort_by(|ob1, ob2| match keep_higher {
-        true => (ob1.score * -1.0).total_cmp(&(ob2.score * -1.0)),
-        false => ob1.score.total_cmp(&ob2.score),
+        true => (ob1.borrow().score * -1.0).total_cmp(&(ob2.borrow().score * -1.0)),
+        false => ob1.borrow().score.total_cmp(&ob2.borrow().score),
     });
 
     let num_objects = objects.len();
@@ -224,11 +666,11 @@ fn nms(
     }
 
     for object2_num in 1..num_objects {
-        let ob2_rect = &objects[object2_num].bbox;
+        let ob2_rect = &objects[object2_num].borrow().bbox;
         let ob2_area = ob2_rect.area();
         for object1_num in 0..object2_num {
             if !suppression[object1_num] {
-                let ob1_rect = &objects[object1_num].bbox;
+                let ob1_rect = &objects[object1_num].borrow().bbox;
                 let ob1_area = ob1_rect.area();
                 let intersect_area = ob1_rect.intersect(ob2_rect).area();
                 let metric = match match_criteria {
@@ -246,7 +688,7 @@ fn nms(
         }
     }
 
-    for i in objects.len() - 1..0 {
+    for i in (0..objects.len()).rev() {
         if suppression[i] {
             objects.remove(i);
         }
@@ -260,9 +702,13 @@ fn divide_or_zero(a: f32, b: f32) -> f32 {
     }
 }
 
-fn remove_objects_without_content(page_spans: &Vec<&TableToken>, objects: &mut Vec<&TableObject>) {
-    for (i, obj) in objects.clone().iter().enumerate().rev() {
-        let (ob_text, _) = extract_text_inside_bbox(page_spans, &obj.bbox);
+fn remove_objects_without_content(
+    page_spans: &Vec<&TableToken>,
+    objects: &mut Vec<RefCell<TableObject>>,
+) {
+    for i in (0..objects.len()).rev() {
+        let obj = &mut objects[i];
+        let (ob_text, _) = extract_text_inside_bbox(page_spans, &obj.borrow().bbox);
         if ob_text.trim().len() == 0 {
             objects.remove(i);
         }
@@ -352,12 +798,13 @@ fn extract_text_from_spans(
 }
 
 fn nms_by_containment(
-    container_objects: &mut Vec<&TableObject>,
+    container_objects: &mut Vec<RefCell<TableObject>>,
     package_objects: &Vec<&TableToken>,
     overlap_threshold: f32,
     _early_exit_vertical: bool,
 ) {
-    container_objects.sort_by(|toa, tob| (toa.score * -1.0).total_cmp(&(tob.score * -1.0)));
+    container_objects
+        .sort_by(|toa, tob| (toa.borrow().score * -1.0).total_cmp(&(tob.borrow().score * -1.0)));
     let num_objects = container_objects.len();
     let mut suppression = Vec::with_capacity(num_objects);
     for _ in 0..num_objects {
@@ -404,14 +851,14 @@ fn nms_by_containment(
 // }
 
 #[derive(Clone)]
-struct MatchScore<'a> {
-    pub container: &'a TableObject,
+struct MatchScore {
+    pub container: RefCell<TableObject>,
     pub container_num: usize,
     pub score: f32,
 }
 
 fn slot_into_containers(
-    container_objects: &Vec<&TableObject>,
+    container_objects: &Vec<RefCell<TableObject>>,
     package_objects: &Vec<&TableToken>,
     overlap_threshold: f32,
     unique_assignment: bool,
@@ -435,25 +882,22 @@ fn slot_into_containers(
         );
     }
 
-    let sorted_co = match _early_exit_vertical {
-        true => {
-            let mut x = container_objects
-                .iter()
-                .enumerate()
-                .map(|(i, &ob)| (i, ob))
-                .collect::<Vec<(usize, &TableObject)>>();
-            x.sort_by(|(_, toa), (_, tob)| toa.bbox.y1.total_cmp(&tob.bbox.y1));
-            x
-        }
-        false => {
-            let mut x = container_objects
-                .iter()
-                .enumerate()
-                .map(|(i, &ob)| (i, ob))
-                .collect::<Vec<(usize, &TableObject)>>();
-            x.sort_by(|(_, toa), (_, tob)| toa.bbox.x1.total_cmp(&tob.bbox.x1));
-            x
-        }
+    let sorted_co = if _early_exit_vertical {
+        let mut x = container_objects
+            .iter()
+            .enumerate()
+            .map(|(i, ob)| (i, ob.clone()))
+            .collect::<Vec<(usize, RefCell<TableObject>)>>();
+        x.sort_by(|(_, toa), (_, tob)| toa.borrow().bbox.y1.total_cmp(&tob.borrow().bbox.y1));
+        x
+    } else {
+        let mut x = container_objects
+            .iter()
+            .enumerate()
+            .map(|(i, ob)| (i, ob.clone()))
+            .collect::<Vec<(usize, RefCell<TableObject>)>>();
+        x.sort_by(|(_, toa), (_, tob)| toa.borrow().bbox.x1.total_cmp(&tob.borrow().bbox.x1));
+        x
     };
 
     for (pi, package) in package_objects.iter().enumerate() {
@@ -464,30 +908,32 @@ fn slot_into_containers(
         }
         let package_area = package_rect.area();
         for (ci, container) in &sorted_co {
-            if !_early_exit_vertical && container.bbox.x1 > container.bbox.x2 {
+            if !_early_exit_vertical && container.borrow().bbox.x1 > container.borrow().bbox.x2 {
                 if match_scores.len() == 0 {
                     match_scores.push(MatchScore {
-                        container: &container,
+                        container: container.clone(),
                         container_num: *ci,
                         score: 0.0,
                     });
                 }
                 break;
-            } else if _early_exit_vertical && container.bbox.y1 > container.bbox.y2 {
+            } else if _early_exit_vertical
+                && container.borrow().bbox.y1 > container.borrow().bbox.y2
+            {
                 if match_scores.len() == 0 {
                     match_scores.push(MatchScore {
-                        container: &container,
+                        container: container.clone(),
                         container_num: *ci,
                         score: 0.0,
                     });
                 }
                 break;
             }
-            let container_rect = &container.bbox;
+            let container_rect = &container.borrow().bbox;
             let intersect_area = container_rect.intersect(package_rect).area();
             let overlap_fraction = intersect_area / package_area;
             match_scores.push(MatchScore {
-                container: &container,
+                container: container.clone(),
                 container_num: *ci,
                 score: overlap_fraction,
             });
@@ -592,6 +1038,34 @@ impl BBox {
             return false;
         }
         return self.intersect(other).area() / myarea >= threshold;
+    }
+
+    fn union(self: &Self, other: &Self) -> Self {
+        let x1 = if self.x1 < other.x1 {
+            other.x1
+        } else {
+            self.x1
+        };
+        let x2 = if self.x2 > other.x2 {
+            other.x2
+        } else {
+            self.x2
+        };
+        let y1 = if self.y1 < other.y1 {
+            other.y1
+        } else {
+            self.y2
+        };
+        let y2 = if self.y2 > other.y2 {
+            other.y2
+        } else {
+            self.y2
+        };
+
+        if x1 >= x2 || y1 >= y2 {
+            return BBox::empty();
+        }
+        return BBox { x1, y1, x2, y2 };
     }
 }
 
